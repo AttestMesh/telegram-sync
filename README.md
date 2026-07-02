@@ -1,33 +1,35 @@
 # telegram-sync
 
-Standalone Telegram → Postgres sync daemon, extracted from the `telegram-mcp`
-bridge (`~/telegram-mcp/telegram-bridge`). It keeps only the syncing
-functionality — no REST API, no MCP server — and stores everything in Postgres.
+A headless daemon that syncs your Telegram account into Postgres — every chat
+and message, continuously, with optional AI-generated descriptions of images.
+Point it at your account once and you get a queryable, full-text-searchable
+archive that stays current.
 
-## Improvements over the original bridge sync
+## What it does
 
-| Original bridge | This service |
-|---|---|
-| SQLite, 32-bit `Integer` IDs (overflow on Telegram IDs in Postgres) | Postgres, `BIGINT` IDs, `TIMESTAMPTZ` timestamps |
-| Re-fetches a fixed 100 messages per dialog on every pass | Incremental: per-chat `last_message_id` watermark (`sync_state` table), only new messages fetched |
-| Blocking SQLAlchemy calls inside the event loop, one commit per message | Fully async `asyncpg`, batched `ON CONFLICT` upserts in one transaction per dialog |
-| No flood-wait handling | Catches `FloodWaitError` and backs off |
-| New messages only | Also captures message edits (`edited_at` column) |
-| No search index that Postgres can use | GIN full-text index on message content |
-| No health reporting | `GET :8082/health` returns connection state, row counts, last reconcile time |
-| No graceful shutdown | Handles SIGTERM cleanly (Docker-friendly) |
-
-Kept from the original: the periodic reconcile loop that self-heals messages
-dropped by Telethon's live event stream (now cheap, since passes are
-incremental).
+- **Full history sync** on startup: walks your dialogs and backfills message
+  history into Postgres (depth configurable per never-seen chat).
+- **Live updates**: new and edited messages are captured in real time via
+  Telethon's event stream.
+- **Self-healing**: a periodic reconcile pass re-checks recently active chats,
+  so anything the live stream drops is picked up within a minute.
+- **Incremental**: each chat has a `last_message_id` watermark in `sync_state`,
+  so sync passes fetch only what's new — cheap enough to run every 60 seconds.
+- **Fast writes**: fully async (`asyncpg`), batched `ON CONFLICT` upserts in a
+  single transaction per chat, flood-wait aware.
+- **Searchable**: GIN full-text indexes on message content and image
+  descriptions.
+- **Observable**: `GET :8082/health` reports connection state, row counts,
+  media queue status, and last reconcile time; the container handles SIGTERM
+  cleanly and runs as a non-root user.
 
 ## Image understanding (optional)
 
-Set `XAI_API_KEY` and the service also "reads" images sent over Telegram using
-xAI's vision API (default model `grok-4.3`, OpenAI-compatible chat completions).
-Photos and jpeg/png documents are described and any visible text transcribed;
-results land in the `media` table with a GIN full-text index, so screenshots
-become searchable alongside regular messages.
+Set `XAI_API_KEY` and the daemon also "reads" images sent over Telegram using
+xAI's vision API (default model `grok-4.3`). Photos and jpeg/png documents are
+described and any visible text transcribed; results land in the `media` table
+with a full-text index, so screenshots become searchable alongside regular
+messages.
 
 Security posture:
 
@@ -40,7 +42,6 @@ Security posture:
 - Work is durably queued in Postgres (`media.status`): unprocessed images
   survive restarts, retries are capped at 3 attempts, and calls are rate-limited
   (`VISION_MIN_INTERVAL`, default 1/s).
-- The container runs as a non-root user.
 
 Privacy note: enabling this sends every incoming image (from every synced chat)
 to xAI. Leave `XAI_API_KEY` unset to keep the service text-only.
@@ -59,17 +60,10 @@ docker compose up -d sync
 curl -s localhost:8082/health | jq
 ```
 
-### Reusing the existing bridge session
-
-Instead of logging in again you can copy the already-authorized session from
-the running bridge — but **stop the old bridge first** if you want only one
-client using that session:
-
-```bash
-docker compose up -d postgres   # creates volumes
-docker compose cp ~/telegram-mcp/telegram-bridge/store/telegram_session.session \
-    sync:/data/telegram_session.session   # or: docker run --rm -v telegram-sync_session:/data ...
-```
+API credentials come from https://my.telegram.org/auth. If you already have an
+authorized Telethon session file, you can copy it into the `session` volume as
+`/data/telegram_session.session` instead of logging in — but make sure no other
+client is actively using that session.
 
 ## Querying
 
@@ -98,8 +92,13 @@ ORDER BY m.timestamp DESC LIMIT 20;
 - `sync_state(chat_id, last_message_id, last_synced_at, initial_sync_done)` — incremental watermarks
 - `media(chat_id, message_id, mime_type, size_bytes, sha256, status, description, model, attempts, error, ...)` — image descriptions + durable processing queue
 
+IDs are `BIGINT` (Telegram IDs exceed 32 bits) and timestamps are `TIMESTAMPTZ`.
+Only text-bearing messages are stored; image messages are stored with their
+caption (or empty content) when image understanding is enabled.
+
 ## Configuration
 
 All via environment (see `.env.example`): `DATABASE_URL`, `DIALOG_LIMIT`,
 `INITIAL_SYNC_LIMIT`, `INCREMENTAL_FETCH_CAP`, `RECONCILE_INTERVAL`,
-`RECONCILE_DIALOG_LIMIT`, `HEALTH_PORT`, `LOG_LEVEL`.
+`RECONCILE_DIALOG_LIMIT`, `HEALTH_PORT`, `LOG_LEVEL`, `XAI_API_KEY`,
+`XAI_MODEL`, `XAI_BASE_URL`, `MAX_IMAGE_BYTES`, `VISION_MIN_INTERVAL`.
